@@ -12,11 +12,14 @@ ffi.cdef [[
         int             freq;
     } SDL_AudioSpec;
 
-    bool        SDL_SetHint  (const char *name, const char *value);
-    bool        SDL_Init     (uint32_t flags);
-    void        SDL_Quit     (void);
-    const char *SDL_GetError (void);
-    void        SDL_free     (void *mem);
+    int         SDL_GetVersion    (void);
+    bool        SDL_SetHint       (const char *name, const char *value);
+    bool        SDL_InitSubSystem (uint32_t flags);
+    void        SDL_QuitSubSystem (uint32_t flags);
+    uint32_t    SDL_WasInit       (uint32_t flags);
+    void        SDL_Quit          (void);
+    const char *SDL_GetError      (void);
+    void        SDL_free          (void *mem);
 
     bool SDL_LoadWAV(
         const char     *path,
@@ -41,21 +44,23 @@ ffi.cdef [[
 
 local SDL_INIT_AUDIO                    = 0x00000010
 local SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK = 0xFFFFFFFF
+local SDL_MIN_VERSION                   = 3002000
 local SDL_LIBRARY_NAMES                 = {
     Windows = { "SDL3.dll" },
     OSX     = { "libSDL3.dylib", "/opt/homebrew/lib/libSDL3.dylib", "/usr/local/lib/libSDL3.dylib" },
     Linux   = { "libSDL3.so.0", "libSDL3.so" },
 }
 
+local INT_MAX = 0x7FFFFFFF
+
+local REPLAY_SAVE_EVENT = obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVING
+                       or obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED
+
 local SDL        = nil
 local stream     = nil
 local sound      = { buffer = nil, length = 0, path = nil }
 local sound_path = ""
 local volume     = 1.0
-
-local function sdl_error()
-    return ffi.string(SDL.SDL_GetError())
-end
 
 local LOG_LEVELS = {
     error = obs.LOG_ERROR,
@@ -78,6 +83,18 @@ local function log(level, msg, ...)
     obs.script_log(obs_level, msg)
 end
 
+local function sdl_error()
+    return ffi.string(SDL.SDL_GetError())
+end
+
+local function version_string(v)
+    local major = math.floor(v / 1000000)
+    local minor = math.floor(v / 1000) % 1000
+    local micro = v % 1000
+
+    return string.format("%d.%d.%d", major, minor, micro)
+end
+
 local function library_candidates()
     local names      = SDL_LIBRARY_NAMES[ffi.os] or SDL_LIBRARY_NAMES.Linux
     local candidates = {}
@@ -96,30 +113,50 @@ local function library_candidates()
 end
 
 local function load_sdl()
+    local lib, lib_path
+
     for _, path in ipairs(library_candidates()) do
-        local ok, lib = pcall(ffi.load, path)
+        local ok, result = pcall(ffi.load, path)
 
         if ok then
-            SDL = lib
-            log("info", "loaded SDL3 from %s", path)
+            lib, lib_path = result, path
             break
         end
     end
 
-    if not SDL then
+    if not lib then
         log("error", "could not find SDL3 (put it next to this script or install it system-wide)")
         return false
     end
 
-    SDL.SDL_SetHint("SDL_NO_SIGNAL_HANDLERS", "1")
+    local version = lib.SDL_GetVersion()
 
-    if not SDL.SDL_Init(SDL_INIT_AUDIO) then
-        log("error", "SDL_Init failed: %s", sdl_error())
-        SDL = nil
+    if version < SDL_MIN_VERSION then
+        log("error", "%s is SDL %s, but 3.2.0 or newer is required", lib_path, version_string(version))
         return false
     end
 
+    lib.SDL_SetHint("SDL_NO_SIGNAL_HANDLERS", "1")
+
+    if not lib.SDL_InitSubSystem(SDL_INIT_AUDIO) then
+        log("error", "SDL_InitSubSystem failed: %s", ffi.string(lib.SDL_GetError()))
+        return false
+    end
+
+    SDL = lib
+    log("info", "loaded SDL %s from %s", version_string(version), lib_path)
+
     return true
+end
+
+local function unload_sdl()
+    SDL.SDL_QuitSubSystem(SDL_INIT_AUDIO)
+
+    if SDL.SDL_WasInit(0) == 0 then
+        SDL.SDL_Quit()
+    end
+
+    SDL = nil
 end
 
 local function unload_sound()
@@ -154,6 +191,12 @@ local function load_sound(path)
     sound.buffer = buffer[0]
     sound.length = length[0]
 
+    if sound.length > INT_MAX then
+        log("warn", "could not load %s: file is too large", path)
+        unload_sound()
+        return false
+    end
+
     stream = SDL.SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, spec, nil, nil)
 
     if stream == nil then
@@ -170,13 +213,25 @@ local function load_sound(path)
     return true
 end
 
+local function play_sound()
+    if stream == nil then
+        return
+    end
+
+    if not SDL.SDL_ClearAudioStream(stream)
+        or not SDL.SDL_PutAudioStreamData(stream, sound.buffer, sound.length) then
+        log("warn", "could not play sound: %s", sdl_error())
+    end
+end
+
 local function apply_settings()
     if not SDL then
         return
     end
 
     if sound_path ~= sound.path then
-        sound.path = load_sound(sound_path) and sound_path or nil
+        sound.path = sound_path
+        load_sound(sound_path)
     end
 
     if stream ~= nil then
@@ -184,17 +239,18 @@ local function apply_settings()
     end
 end
 
-local function play_sound()
-    if stream == nil then
-        return
+local function on_test_clicked()
+    if SDL and stream == nil and sound_path ~= "" then
+        load_sound(sound_path)
     end
 
-    SDL.SDL_ClearAudioStream(stream)
-    SDL.SDL_PutAudioStreamData(stream, sound.buffer, sound.length)
+    play_sound()
+
+    return false
 end
 
 local function on_frontend_event(event)
-    if event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVING then
+    if event == REPLAY_SAVE_EVENT then
         play_sound()
     end
 end
@@ -209,7 +265,7 @@ function script_properties()
 
     obs.obs_property_int_set_suffix(volume_slider, "%")
     obs.obs_properties_add_path(props, "sound_path", "Sound file", obs.OBS_PATH_FILE, "WAV files (*.wav)", nil)
-    obs.obs_properties_add_button(props, "test", "Test sound", function() play_sound() return false end)
+    obs.obs_properties_add_button(props, "test", "Test sound", on_test_clicked)
 
     return props
 end
@@ -238,8 +294,7 @@ function script_unload()
     end
 
     unload_sound()
-    SDL.SDL_Quit()
+    unload_sdl()
 
-    SDL        = nil
     sound.path = nil
 end
